@@ -1,4 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved\n
+# Lightweight build — removed vision_encoder, ranking, span_predictor
 
 import math
 import re
@@ -6,7 +7,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 import torch
-from core.audio_visual_encoder import PEAudioFrame, PEAudioFrameTransform
 from torchdiffeq import odeint
 
 from sam_audio.model.align import AlignModalities
@@ -15,9 +15,7 @@ from sam_audio.model.codec import DACVAE
 from sam_audio.model.config import SAMAudioConfig
 from sam_audio.model.text_encoder import T5TextEncoder
 from sam_audio.model.transformer import DiT
-from sam_audio.model.vision_encoder import PerceptionEncoder
 from sam_audio.processor import Batch
-from sam_audio.ranking import create_ranker
 
 DFLT_ODE_OPT = {"method": "midpoint", "options": {"step_size": 2 / 32}}
 
@@ -80,7 +78,8 @@ class SAMAudio(BaseModel):
         super().__init__()
         self.audio_codec = DACVAE(cfg.audio_codec)
         self.text_encoder = T5TextEncoder(cfg.text_encoder)
-        self.vision_encoder = PerceptionEncoder(cfg.vision_encoder)
+        # Vision encoder stubbed out — not needed for audio-only inference
+        self.vision_encoder = None
         self.transformer = DiT(cfg.transformer)
         self.proj = torch.nn.Linear(cfg.in_channels, cfg.transformer.dim)
         self.align_masked_video = AlignModalities(
@@ -91,15 +90,9 @@ class SAMAudio(BaseModel):
         )
         self.memory_proj = torch.nn.Linear(cfg.text_encoder.dim, cfg.transformer.dim)
         self.timestep_emb = SinusoidalEmbedding(cfg.transformer.dim)
-        self.visual_ranker = create_ranker(cfg.visual_ranker)
-        self.text_ranker = create_ranker(cfg.text_ranker)
-        if cfg.span_predictor is not None:
-            self.span_predictor = PEAudioFrame.from_config(
-                cfg.span_predictor, pretrained=True
-            )
-            self.span_predictor_transform = PEAudioFrameTransform.from_config(
-                cfg.span_predictor
-            )
+        # Rankers and span predictor stubbed out
+        self.visual_ranker = None
+        self.text_ranker = None
 
     @property
     def sample_rate(self):
@@ -141,23 +134,6 @@ class SAMAudio(BaseModel):
     ):
         """
         Forward pass for the model.  Represents one function evaluation of the ODE.
-        In the below descriptions, B is batch size, T is sequence length, C is channel size.
-        Note that the size of C and T may vary across arguments (ex. text_features vs. audio_features),
-        it is used only to designate a Channel or time/sequence-length dimension respectively.
-
-        Args:
-            noisy_audio (torch.Tensor): Noisy audio input tensor (being denoised).
-            audio_features (torch.Tensor): Clean audio features [B x T x C].
-            text_features (torch.Tensor): Encoded text features tensor [B x T x C].
-            time (torch.Tensor): Timestep tensor for positional encoding [B].
-            masked_video_features (Optional[torch.Tensor], optional): Masked video features tensor. [B x C x T].
-            text_mask (Optional[torch.Tensor], optional): Padding mask for text features. [B x T].
-            anchor_ids (Optional[torch.Tensor], optional): Anchor IDs tensor. Defaults to None [B x T].
-            anchor_alignment (Optional[torch.Tensor], optional): Anchor alignment tensor. B x T.
-            audio_pad_mask (Optional[torch.Tensor], optional): Padding mask for audio input. [B x T].
-
-        Returns:
-            torch.Tensor
         """
         aligned_inputs = self.align_inputs(
             noisy_audio,
@@ -185,10 +161,8 @@ class SAMAudio(BaseModel):
 
     def _get_video_features(self, video, audio_features):
         B, T, _ = audio_features.shape
-        if video is None:
-            return audio_features.new_zeros(B, self.vision_encoder.dim, T)
-        else:
-            return self.vision_encoder(video).transpose(1, 2)
+        # Always return zeros — no vision encoder in lightweight build
+        return audio_features.new_zeros(B, 1024, T)
 
     def _repeat_for_reranking(self, tensor, candidates):
         if candidates > 1:
@@ -228,22 +202,6 @@ class SAMAudio(BaseModel):
             ),
         }
 
-    def predict_spans(
-        self, batch: Batch, audio_features: torch.Tensor, audio_pad_mask: torch.Tensor
-    ) -> Batch:
-        input = self.span_predictor_transform(text=batch.descriptions).to(
-            audio_features.device
-        )
-        output = self.span_predictor(
-            input_features=audio_features[:, :, :128],
-            padding_mask=audio_pad_mask,
-            return_spans=True,
-            **input,
-        )
-        anchors = [[["+"] + anchor for anchor in anchors] for anchors in output.spans]
-        batch.process_anchors(anchors)
-        return batch
-
     @torch.inference_mode()
     def separate(
         self,
@@ -255,17 +213,6 @@ class SAMAudio(BaseModel):
     ) -> SeparationResult:
         # Encode audio
         forward_args = self._get_forward_args(batch, candidates=reranking_candidates)
-
-        if predict_spans and hasattr(self, "span_predictor") and batch.anchors is None:
-            batch = self.predict_spans(
-                batch=batch,
-                audio_features=self._unrepeat_from_reranking(
-                    forward_args["audio_features"], reranking_candidates
-                ),
-                audio_pad_mask=self._unrepeat_from_reranking(
-                    forward_args["audio_pad_mask"], reranking_candidates
-                ),
-            )
 
         audio_features = forward_args["audio_features"]
         B, T, C = audio_features.shape
@@ -289,7 +236,6 @@ class SAMAudio(BaseModel):
             **ode_opt,
         )
         generated_features = states[-1].transpose(1, 2)
-        # generated_features has shape [B, 2C, T].  Reshape to stack along the batch dimension
         wavs = self.audio_codec.decode(generated_features.reshape(2 * B, C, T)).view(
             B, 2, -1
         )
@@ -303,31 +249,8 @@ class SAMAudio(BaseModel):
             wavs[:, 1].view(bsz, reranking_candidates, -1), sizes
         )
 
-        if (
-            reranking_candidates > 1
-            and batch.masked_video is not None
-            and self.visual_ranker is not None
-        ):
-            scores = self.visual_ranker(
-                extracted_audio=target_wavs,
-                videos=batch.masked_video,
-                sample_rate=self.audio_codec.sample_rate,
-            )
-            idxs = scores.argmax(dim=1)
-        elif reranking_candidates > 1 and self.text_ranker is not None:
-            input_audio = [
-                audio[:, :size].expand(reranking_candidates, -1)
-                for audio, size in zip(batch.audios, sizes, strict=False)
-            ]
-            scores = self.text_ranker(
-                extracted_audio=target_wavs,
-                input_audio=input_audio,
-                descriptions=batch.descriptions,
-                sample_rate=self.audio_codec.sample_rate,
-            )
-            idxs = scores.argmax(dim=1)
-        else:
-            idxs = torch.zeros(bsz, dtype=torch.long, device=noise.device)
+        # No rankers — always pick first candidate
+        idxs = torch.zeros(bsz, dtype=torch.long, device=noise.device)
 
         return SeparationResult(
             target=[wav[idx] for wav, idx in zip(target_wavs, idxs, strict=False)],
@@ -350,9 +273,10 @@ class SAMAudio(BaseModel):
             )
             # We load this directly from HF, not in checkpoint
             skip_regex = re.compile(
-                "(^text_encoder|^visual_ranker|^text_ranker|^span_predictor)"
+                "(^text_encoder|^visual_ranker|^text_ranker|^span_predictor|^vision_encoder)"
             )
             missing_keys = [x for x in missing_keys if not re.search(skip_regex, x)]
+            unexpected_keys = [x for x in unexpected_keys if not re.search(skip_regex, x)]
             if len(missing_keys) > 0 or len(unexpected_keys) > 0:
                 raise RuntimeError(
                     f"Missing keys: {missing_keys}, unexpected_keys: {unexpected_keys}"

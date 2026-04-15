@@ -1,10 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved\n
+# Lightweight build — removed core.audio_visual_encoder and SAMAudioJudgeConfig
 
 from typing import Optional, Tuple
 
 import numpy as np
-from core.audio_visual_encoder.config import TransformerConfig as PEAVTransformerConfig
-from transformers import ModernBertConfig
 
 
 class DACVAEConfig:
@@ -229,23 +228,3 @@ class SAMAudioConfig:
             None if text_ranker is None else parse_ranker_config(text_ranker)
         )
         self.span_predictor = span_predictor
-
-
-class SAMAudioJudgeConfig:
-    def __init__(
-        self,
-        audio_codec: DACVAEConfig = None,
-        transformer: PEAVTransformerConfig = None,
-        text_model: ModernBertConfig = None,
-        finetune_transformer: PEAVTransformerConfig = None,
-        nth_text_layer: int = 22,
-        bottleneck_dim: int = 256,
-    ):
-        self.audio_codec = DACVAEConfig(**(audio_codec or {}))
-        self.transformer = PEAVTransformerConfig(**(transformer or {}))
-        self.text_model = ModernBertConfig(**(text_model or {}))
-        self.finetune_transformer = PEAVTransformerConfig(
-            **(finetune_transformer or {})
-        )
-        self.nth_text_layer = nth_text_layer
-        self.bottleneck_dim = bottleneck_dim

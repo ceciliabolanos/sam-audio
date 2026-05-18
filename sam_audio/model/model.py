@@ -135,7 +135,7 @@ class SAMAudio(BaseModel):
         """
         Forward pass for the model.  Represents one function evaluation of the ODE.
         """
-        aligned_inputs = self.align_inputs(
+        aligned_inputs = self.align_inputs( ### Aca alinemos el audio con las otras modalidades, aunque en este caso el video es solo ceros y no aporta info. El resultado es lo que se le va a pasar al transformer
             noisy_audio,
             audio_features,
             masked_video_features=masked_video_features,
